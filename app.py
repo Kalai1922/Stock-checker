@@ -1,7 +1,7 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from datetime import date
+from datetime import date, timedelta
 
 st.set_page_config(layout="wide", page_title="Tweet Stock Checker")
 st.title("🔎 Tweet Stock Checker — 4-Gate Study Framework")
@@ -160,7 +160,7 @@ def check_rbs(df):
 
 # ---------------- Fundamentals ----------------
 def fundamentals(stock):
-    out = {"fin": False, "yoy_q": None, "ann": None, "hi": None, "note": "", "pat_cr": None, "de": None, "roe": None, "roce": None}
+    out = {"fin": False, "yoy_q": None, "ann": None, "hi": None, "note": "", "pat_cr": None, "spike": False, "de": None, "roe": None, "roce": None}
     try:
         info = stock.info
         out["fin"] = info.get("sector") == "Financial Services"
@@ -176,6 +176,8 @@ def fundamentals(stock):
             if len(s) >= 4: out["pat_cr"] = s.iloc[:4].sum() / 1e7
             if len(s) >= 2 and s.nunique() > 1:
                 out["hi"] = bool(s.iloc[0] >= s.max())
+                rest = s.drop(s.idxmax())
+                out["spike"] = bool(s.idxmax() != s.index[0] and len(rest) >= 2 and s.max() > 3 * abs(rest.median()) and s.max() > 0)
                 out["note"] = "Quarters (latest→oldest, ₹ cr): " + ", ".join(f"{v/1e7:,.0f}" for v in s.values)
     except Exception: pass
     try:
@@ -196,72 +198,113 @@ def icon(v):
     return "🟡" if v is None else ("✅" if v else "❌")
 
 # ---------------- UI ----------------
-if "log" not in st.session_state: st.session_state.log = []
+for k, v in [("log", []), ("results", []), ("run", 0)]:
+    if k not in st.session_state: st.session_state[k] = v
+
+CHECKLIST = [
+    "1. Strategy confluence: one of my 4 setups is live right now",
+    "2. ATH / support verified on the TradingView chart (not just yfinance)",
+    "3. Meaningful target upside: target is below ATH",
+    "4. Confirmed Entry (or Early Entry with highest-ever profit verified on Screener)",
+    "5. Business quality on Screener 10-yr: highest-ever profit, no one-off spike, low pledge, healthy cash flow, non-PSU, retail < 30%",
+    "6. One clean pick: better than my other candidates",
+]
+
+def analyse(sym, source):
+    r = {"sym": sym, "source": source}
+    try:
+        stock = yf.Ticker(sym); dmax = stock.history(period="max")
+        if dmax.empty or len(dmax) < 60:
+            r["error"] = "Not enough price data. Check the ticker symbol."; return r
+        df2 = dmax.iloc[-504:]; px = dmax["Close"].iloc[-1]
+        ath = dmax["High"].max(); f = fundamentals(stock); tags = membership(sym)
+
+        if tags: g1, g1n = True, "In list: " + ", ".join(tags)
+        else:
+            if f["fin"]:
+                chk = [f["roe"] is not None and f["roe"] > 0.10, f["pat_cr"] is not None and f["pat_cr"] > 1000]
+                g1n = f"Not in any list. Financial proxy → ROE>10%: {icon(chk[0])}, PAT>₹1000cr: {icon(chk[1])}"
+            else:
+                chk = [f["de"] is not None and f["de"] < 0.25, f["roce"] is not None and f["roce"] > 0.20,
+                       f["pat_cr"] is not None and f["pat_cr"] > 200]
+                g1n = f"Not in any list. Proxy → D/E<0.25: {icon(chk[0])}, ROCE>20%: {icon(chk[1])}, PAT>₹200cr: {icon(chk[2])}"
+            g1 = all(chk)
+            g1n += " (proxy only — confirm on Screener; also check PSU / retail holding >30%)"
+
+        pos = [x for x in (f["yoy_q"], f["ann"]) if x is not None]
+        g2 = None if not pos else all(x > 0 for x in pos)
+        q_txt = f"{f['yoy_q']:.1f}%" if f["yoy_q"] is not None else "n/a"
+        a_txt = f"{f['ann']:.1f}%" if f["ann"] is not None else "n/a"
+        spike = "  \n⚠️ **One-off spike spotted** in the quarterly series — growth numbers may be distorted." if f["spike"] else ""
+        r["gate2"] = (f"**Gate 2 — Business quality** {icon(g2)}  \nQuarterly PAT YoY: {q_txt} | Annual PAT growth: {a_txt}  \n"
+                      f"{f['note']}{spike}  \n⚠️ Confirm highest-ever profit + pledge % + cash flow on Screener (10-yr view).")
+
+        fall = (ath - px) / ath * 100
+        r["gate3"] = (f"**Gate 3 — Strategy trigger**  \nPrice ₹{px:.2f} | ATH ₹{ath:.2f} | {fall:.1f}% below ATH — "
+                      f"{'✅ below 0.8×ATH' if px < 0.8 * ath else '❌ above 0.8×ATH, most targets would exceed ATH'}")
+        strats, hits, levels = [], [], ""
+        for name, fn in [("LTH", lambda: check_lth(dmax)), ("V20", lambda: check_v20(df2)),
+                         ("CWH", lambda: check_cwh(df2, f["hi"])), ("RBS", lambda: check_rbs(df2))]:
+            try: ok, msg, info = fn()
+            except Exception as e: ok, msg, info = False, f"error ({e})", {}
+            strats.append((name, ok, msg, info))
+            if ok:
+                hits.append(name)
+                if not levels and info: levels = f"{name}: " + ", ".join(f"{k}: {v}" for k, v in info.items())
+
+        if not g1: verdict = "SKIP — Not our universe"
+        elif g2 is False: verdict = "SKIP — Profits not improving"
+        elif hits: verdict = "STUDY-READY — " + ", ".join(hits)
+        else: verdict = "WATCH — Quality passes, no setup yet"
+        r.update(g1=g1, g1n=g1n, g2=g2, strats=strats, hits=hits, levels=levels, verdict=verdict)
+    except Exception as e:
+        r["error"] = f"Could not process {sym}: {e}"
+    return r
+
+def render(r, run):
+    b = base(r["sym"]); k = f"{run}_{b}"
+    st.divider(); st.subheader(f"📌 {b}")
+    if "error" in r: st.warning(r["error"]); return
+    st.markdown(f"**Gate 1 — Universe** {icon(r['g1'])}  \n{r['g1n']}")
+    st.markdown(r["gate2"]); st.markdown(r["gate3"])
+    for name, ok, msg, info in r["strats"]:
+        st.markdown(f"- {'✅' if ok else '▫️'} **{name}** — {msg}")
+        if ok and info: st.json(info)
+    v = r["verdict"]
+    (st.success if v.startswith("STUDY") else st.info if v.startswith("WATCH") else st.error)(f"Gate 4 — Verdict: **{v}**")
+
+    with st.expander("✅ 6-Point Conviction Checklist", expanded=v.startswith("STUDY")):
+        checks = [st.checkbox(t, key=f"{k}_c{i}") for i, t in enumerate(CHECKLIST)]
+        score = sum(checks)
+        levels = st.text_input("Levels (invalidation / target)", value=r["levels"], key=f"{k}_lv")
+        today = date.today()
+        review = st.date_input("Sunday review date", today + timedelta(days=(6 - today.weekday()) % 7 or 7), key=f"{k}_rv")
+        if v.startswith("SKIP"): decision = "SKIP"
+        elif score == 6: decision = "ENTER"
+        else: decision = "WAIT"
+        st.progress(score / 6, text=f"Score {score}/6 → {decision}")
+        if decision == "ENTER": st.success("6/6 — all conviction points met. Execute with calm focus. 🌟")
+        elif decision == "WAIT": st.info("Below 6/6 means WAIT. Waiting is a decision too. 🌿")
+        else: st.error("Gate 1 or 2 failed — SKIP. No checklist can fix that.")
+        if st.button("💾 Save to study log", key=f"{k}_save"):
+            row = {"Date": date.today().isoformat(), "Stock": b, "Source": r["source"],
+                   "Universe": "Y" if r["g1"] else "N", "Profit trend": icon(r["g2"]),
+                   "Setup": ", ".join(r["hits"]) or "—", "Verdict": v, "Checklist": f"{score}/6",
+                   "Decision": decision, "Levels": levels, "Review date": str(review)}
+            st.session_state.log = [x for x in st.session_state.log
+                                    if not (x["Date"] == row["Date"] and x["Stock"] == row["Stock"])] + [row]
+            st.toast(f"{b} saved to log")
 
 raw = st.text_input("Ticker(s) from today's tweets (comma separated, e.g. KAYNES, TRENT, IEX)", "")
 source = st.text_input("Source (optional — who tweeted it)", "")
 
 if st.button("Run 4-Gate Check") and raw.strip():
-    for sym in [norm(x) for x in raw.split(",") if x.strip()]:
-        st.divider(); st.subheader(f"📌 {base(sym)}")
-        try:
-            stock = yf.Ticker(sym); dmax = stock.history(period="max")
-            if dmax.empty or len(dmax) < 60:
-                st.warning("Not enough price data. Check the ticker symbol."); continue
-            df2 = dmax.iloc[-504:]; px = dmax["Close"].iloc[-1]
-            ath = dmax["High"].max(); f = fundamentals(stock); tags = membership(sym)
+    st.session_state.run += 1
+    with st.spinner("Studying..."):
+        st.session_state.results = [analyse(norm(x), source) for x in raw.split(",") if x.strip()]
 
-            # Gate 1
-            if tags: g1, g1n = True, "In list: " + ", ".join(tags)
-            else:
-                if f["fin"]:
-                    chk = [f["roe"] is not None and f["roe"] > 0.10, f["pat_cr"] is not None and f["pat_cr"] > 1000]
-                    g1n = f"Not in any list. Financial proxy → ROE>10%: {icon(chk[0])}, PAT>₹1000cr: {icon(chk[1])}"
-                else:
-                    chk = [f["de"] is not None and f["de"] < 0.25, f["roce"] is not None and f["roce"] > 0.20,
-                           f["pat_cr"] is not None and f["pat_cr"] > 200]
-                    g1n = f"Not in any list. Proxy → D/E<0.25: {icon(chk[0])}, ROCE>20%: {icon(chk[1])}, PAT>₹200cr: {icon(chk[2])}"
-                g1 = all(chk)
-                g1n += " (proxy only — confirm on Screener; also check PSU / retail holding >30%)"
-            st.markdown(f"**Gate 1 — Universe** {icon(g1)}  \n{g1n}")
-
-            # Gate 2
-            pos = [x for x in (f["yoy_q"], f["ann"]) if x is not None]
-            g2 = None if not pos else all(x > 0 for x in pos)
-            q_txt = f"{f['yoy_q']:.1f}%" if f["yoy_q"] is not None else "n/a"
-            a_txt = f"{f['ann']:.1f}%" if f["ann"] is not None else "n/a"
-            st.markdown(f"**Gate 2 — Business quality** {icon(g2)}  \nQuarterly PAT YoY: {q_txt} | Annual PAT growth: {a_txt}  \n"
-                        f"{f['note']}  \n⚠️ Confirm highest-ever profit + pledge % + cash flow on Screener (10-yr view).")
-
-            # Gate 3
-            fall = (ath - px) / ath * 100
-            below = px < 0.8 * ath
-            st.markdown(f"**Gate 3 — Strategy trigger**  \nPrice ₹{px:.2f} | ATH ₹{ath:.2f} | {fall:.1f}% below ATH — "
-                        f"{'✅ below 0.8×ATH' if below else '❌ above 0.8×ATH, most targets would exceed ATH'}")
-            hits = []
-            for name, fn in [("LTH", lambda: check_lth(dmax)), ("V20", lambda: check_v20(df2)),
-                             ("CWH", lambda: check_cwh(df2, f["hi"])), ("RBS", lambda: check_rbs(df2))]:
-                try: ok, msg, info = fn()
-                except Exception as e: ok, msg, info = False, f"error ({e})", {}
-                if ok: hits.append(name)
-                st.markdown(f"- {'✅' if ok else '▫️'} **{name}** — {msg}")
-                if ok and info: st.json(info)
-
-            # Verdict
-            if not g1: verdict = "SKIP — Not our universe"
-            elif g2 is False: verdict = "SKIP — Profits not improving"
-            elif hits: verdict = "STUDY-READY — " + ", ".join(hits)
-            else: verdict = "WATCH — Quality passes, no setup yet"
-            (st.success if verdict.startswith("STUDY") else st.info if verdict.startswith("WATCH") else st.error)(f"Gate 4 — Verdict: **{verdict}**")
-            if verdict.startswith("STUDY"):
-                st.caption("Before any entry: strategy confluence ✔ · ATH/support verified on TradingView ✔ · target upside meaningful ✔ · "
-                           "Confirmed Entry preferred ✔ · business verified on Screener ✔ · one clean pick over several average ones ✔")
-
-            st.session_state.log.append({"Date": date.today().isoformat(), "Stock": base(sym), "Source": source,
-                                         "Universe": "Y" if g1 else "N", "Profit trend": icon(g2),
-                                         "Setup": ", ".join(hits) or "—", "Verdict": verdict})
-        except Exception as e:
-            st.warning(f"Could not process {sym}: {e}")
+for r in st.session_state.results:
+    render(r, st.session_state.run)
 
 if st.session_state.log:
     st.divider(); st.subheader("📒 Today's study log (paste into your Master Ledger)")
